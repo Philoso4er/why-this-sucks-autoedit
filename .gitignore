@@ -1,0 +1,15 @@
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.srt
+*.vtt
+*.ass
+__pycache__/
+.env
+my_videos/
+output/
