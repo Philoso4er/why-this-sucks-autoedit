@@ -1,6 +1,6 @@
 # Why This Sucks – Auto-Editor
 
-A free tool that runs on your own computer and turns **a folder of pictures + a voiceover + a caption file** into a finished YouTube video (1920×1080, 30 fps, MP4). There are no subscriptions or paid services; it only uses the free programs **ffmpeg** and **Python**.
+A free tool that runs on your own computer and turns **a folder of pictures + a voiceover + a caption file** into a finished video at 30 fps (MP4): a normal YouTube video (16:9), a Short / Reel / TikTok (9:16), a square (1:1) or a portrait feed post (4:5). There are no subscriptions or paid services; it only uses the free programs **ffmpeg** and **Python**.
 
 What it does automatically:
 
@@ -67,6 +67,35 @@ Optional extras:
 | `--sfx my_sfx_folder` | uses your own sound effects: name the files `whoosh.wav`, `crackle.wav`, `stamp.wav`, `boom.wav`, `ding.wav`, `pop.wav`, or any name you use in the keyword list |
 | `--config my_config.json` | changes settings (see below) |
 
+### Shorts, Reels, TikTok, square and portrait
+
+Add `--aspect` to pick the shape of the video:
+
+| `--aspect` | size | use it for |
+|---|---|---|
+| `16:9` (default) | 1920×1080 | normal YouTube videos |
+| `9:16` | 1080×1920 | YouTube Shorts, Instagram Reels, TikTok |
+| `1:1` | 1080×1080 | square posts |
+| `4:5` | 1080×1350 | Instagram and Facebook feed posts |
+
+Your pictures are wide, so for the other shapes you choose how they fill the frame with `--fit`:
+
+- `--fit pan` (default): the picture fills the whole screen and the camera slowly slides from one side to the other. The slide stays in the middle part of the picture, where the main subject usually is. Words near the left or right edge of a picture (title cards, score cards) may be cut off.
+- `--fit blur`: the **whole** picture is shown, with a blurred, darker copy filling the space above and below it. Nothing is ever cut off.
+
+Captions move and resize automatically for each shape. On 9:16 they sit about two-thirds of the way down the screen, so the like and comment buttons and the video title at the bottom of Shorts and Reels don't cover them. They also show fewer words at a time.
+
+`--max-duration 60` cuts the video to 60 seconds (or any length you choose) and fades the picture and sound out at the end. Shorts and Reels have length limits, so this is useful there.
+
+Example: a full-length vertical version, and a 60-second Short with the whole picture shown:
+
+```
+python autoedit.py --images my_video/images --audio my_video/voiceover.mp3 --captions my_video/captions.srt --aspect 9:16 --out short.mp4
+python autoedit.py --images my_video/images --audio my_video/voiceover.mp3 --captions my_video/captions.srt --aspect 9:16 --fit blur --max-duration 60 --out short_60s.mp4
+```
+
+You can also put these in the config file: `"aspect": "9:16"`, `"fit": "blur"`, `"max_duration": 60`.
+
 A 3-minute video takes roughly 1–3 minutes to render on a normal laptop.
 
 ## 4. Settings (config file)
@@ -74,7 +103,8 @@ A 3-minute video takes roughly 1–3 minutes to render on a normal laptop.
 Copy `config.example.json` to `my_config.json`, keep only the lines you want to change, and pass it with `--config my_config.json`. Useful settings:
 
 - `font`: the caption font. The default is `"Arial Black"` (on Windows and Mac). Any installed font works, e.g. `"Impact"`, `"Anton"` or `"Poppins Black"`. To use a font file without installing it, put the file in a folder and set `fonts_dir`.
-- `font_size`, `highlight_color`, `uppercase`, `max_words`, `caption_margin_bottom`: caption look.
+- `font_size` (110 by default, the size for 16:9; other shapes adjust automatically), `highlight_color`, `uppercase`, `max_words`: caption look.
+- `caption_y`: where the captions sit, as a fraction of the screen height (e.g. `0.65` = 65% of the way down). `0` means automatic.
 - `kenburns_zoom`: how strong the zoom and pan are (0.05 is subtle, 0.25 is strong).
 - `punchin_after` / `segment_target`: when to add punch-in cuts and how often.
 - `music_volume_db`: how far the music sits below the voice (−16 by default; lower numbers make it quieter). Set `duck` to turn ducking on or off.

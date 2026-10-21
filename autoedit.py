@@ -13,7 +13,10 @@ IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 AUDIO_EXT = (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac")
 
 DEFAULT_CONFIG = {
-    "width": 1920, "height": 1080, "fps": 30,
+    "aspect": "16:9",                  # 16:9 (YouTube), 9:16 (Shorts/Reels/TikTok), 1:1, 4:5
+    "fit": "pan",                      # pan = fill the frame and pan across; blur = fit whole image on a blurred background
+    "max_duration": 0,                 # seconds; 0 = full length. Trims with a clean fade (e.g. 60 for Shorts)
+    "fps": 30,
     "crf": 20, "preset": "medium",
     "workers": 0,                      # 0 = auto
     "seed": 7,
@@ -25,10 +28,10 @@ DEFAULT_CONFIG = {
     # captions
     "captions": True,
     "font": "Arial Black", "fonts_dir": "",
-    "font_size": 92, "outline": 6, "shadow": 3,
+    "font_size": 110, "outline": 6, "shadow": 3,   # font_size is for 16:9 1080p; other ratios scale automatically
     "text_color": "#FFFFFF", "highlight_color": "#FFE135", "outline_color": "#000000",
     "uppercase": True, "max_words": 4, "min_words": 2,
-    "caption_margin_bottom": 150,
+    "caption_y": 0,                    # 0 = automatic; else caption position as fraction of height (0.65 = 65% down)
     "highlight_current_word": True, "pop_in": True,
     # music
     "music_volume_db": -16,            # music loudness relative to the voice (LUFS difference) before ducking
@@ -48,6 +51,14 @@ DEFAULT_CONFIG = {
     },
     # loudness
     "target_lufs": -14.0, "true_peak": -1.0,
+}
+
+
+ASPECTS = {  # size, caption font multiplier, caption y (fraction of height), side margin, max words
+    "16:9": ((1920, 1080), 1.00, 0.88, 120, 4),
+    "9:16": ((1080, 1920), 0.92, 0.65, 80, 3),
+    "1:1": ((1080, 1080), 0.80, 0.82, 70, 3),
+    "4:5": ((1080, 1350), 0.82, 0.76, 70, 3),
 }
 
 
@@ -165,28 +176,89 @@ def plan_shots(scenes, cfg, rng):
     return shots
 
 
+def ease(den):
+    return "(0.5-0.5*cos(PI*{v}/%d))" % den
+
+
+def kb_filters(move, N, W, H, fps):
+    """zoompan Ken Burns for an input whose aspect already equals W:H (input at 2x size)."""
+    z0, z1, x0, x1, y0, y1 = move
+    p = ease(max(N - 1, 1)).replace("{v}", "on")
+    z = "{a}+({b}-{a})*{p}".format(a=z0, b=z1, p=p)
+    x = "(iw-iw/zoom)*({a}+({b}-{a})*{p})".format(a=x0, b=x1, p=p)
+    y = "(ih-ih/zoom)*({a}+({b}-{a})*{p})".format(a=y0, b=y1, p=p)
+    return "zoompan=z='{z}':x='{x}':y='{y}':d={N}:s={W}x{H}:fps={fps}".format(z=z, x=x, y=y, N=N, W=W, H=H, fps=fps)
+
+
+def punch_crop(shot):
+    if not shot["crop"]:
+        return []
+    cx, cy, t = shot["crop"]
+    return ["crop=iw*{t}:ih*{t}:(iw-iw*{t})*{cx}:(ih-ih*{t})*{cy}".format(t=t, cx=cx, cy=cy)]
+
+
+def image_aspect(path, cache={}):
+    if path not in cache:
+        r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0", path])
+        w, h = [int(v) for v in r.stdout.strip().split(",")[:2]]
+        cache[path] = w / h
+    return cache[path]
+
+
 def render_shot(shot, cfg, tmp):
     W, H, fps = cfg["width"], cfg["height"], cfg["fps"]
     N = shot["f1"] - shot["f0"]
     out = os.path.join(tmp, "shot_%04d.mp4" % shot["index"])
-    pre = []
+    src_ar = image_aspect(shot["image"])
     if shot["crop"]:
-        cx, cy, t = shot["crop"]
-        pre.append("crop=iw*{t}:ih*{t}:(iw-iw*{t})*{cx}:(ih-ih*{t})*{cy}".format(t=t, cx=cx, cy=cy))
-    # upscale 2x before zoompan to avoid jitter
-    pre.append("scale={0}:{1}:force_original_aspect_ratio=increase:flags=lanczos,crop={0}:{1}".format(W * 2, H * 2))
-    pre.append("setsar=1")
+        src_ar = src_ar  # punch crop keeps aspect
+    mismatch = abs(src_ar - W / H) > 0.05
+    enc = ["-frames:v", str(N), "-r", str(fps), "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", out]
+    if not mismatch:
+        vf = ",".join(punch_crop(shot) + [
+            "scale={0}:{1}:force_original_aspect_ratio=increase:flags=lanczos,crop={0}:{1}".format(W * 2, H * 2),
+            "setsar=1", kb_filters(shot["move"], N, W, H, fps), "format=yuv420p"])
+        run(["ffmpeg", "-y", "-v", "error", "-i", shot["image"], "-vf", vf] + enc)
+        return out
+    if cfg["fit"] == "blur":
+        # foreground: whole image fitted to width (or height), Ken Burns inside; background: blurred fill
+        if src_ar > W / H:
+            fw = W; fh = int(round(W / src_ar / 2)) * 2
+        else:
+            fh = H; fw = int(round(H * src_ar / 2)) * 2
+        fy = int(max(0, min(H - fh, H * cfg["_fg_center"] - fh / 2)))
+        fx = (W - fw) // 2
+        fc = ("[0:v]split=2[a][b];"
+              "[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=30:3,"
+              "eq=brightness=-0.18:saturation=0.8,setsar=1,loop=loop={N}:size=1:start=0,fps={fps}[bg];"
+              "[b]{pc}scale={fw2}:{fh2}:force_original_aspect_ratio=increase:flags=lanczos,crop={fw2}:{fh2},setsar=1,"
+              "{kb}[fg];[bg][fg]overlay={fx}:{fy}:shortest=1,format=yuv420p[v]").format(
+            W=W, H=H, N=N, fps=fps, fw2=fw * 2, fh2=fh * 2, fx=fx, fy=fy,
+            pc="".join(c + "," for c in punch_crop(shot)), kb=kb_filters(shot["move"], N, fw, fh, fps))
+        run(["ffmpeg", "-y", "-v", "error", "-i", shot["image"], "-filter_complex", fc, "-map", "[v]"] + enc)
+        return out
+    # pan: fill the frame; animate the crop window across the image's longer side,
+    # centre-weighted so the middle (where the subject usually is) is always covered.
     z0, z1, x0, x1, y0, y1 = shot["move"]
-    den = max(N - 1, 1)
-    p = "(on/{d})".format(d=den)
-    p = "(0.5-0.5*cos(PI*{p}))".format(p=p)   # ease in/out
-    z = "{a}+({b}-{a})*{p}".format(a=z0, b=z1, p=p)
-    x = "(iw-iw/zoom)*({a}+({b}-{a})*{p})".format(a=x0, b=x1, p=p)
-    y = "(ih-ih/zoom)*({a}+({b}-{a})*{p})".format(a=y0, b=y1, p=p)
-    zp = "zoompan=z='{z}':x='{x}':y='{y}':d={N}:s={W}x{H}:fps={fps}".format(z=z, x=x, y=y, N=N, W=W, H=H, fps=fps)
-    vf = ",".join(pre + [zp, "format=yuv420p"])
-    run(["ffmpeg", "-y", "-v", "error", "-i", shot["image"], "-vf", vf, "-frames:v", str(N),
-         "-r", str(fps), "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", out])
+    wide = src_ar > W / H
+    a0, a1 = (0.25, 0.75) if shot["index"] % 2 == 0 else (0.75, 0.25)
+    if shot["crop"]:
+        a0, a1 = 0.5 + (a0 - 0.5) * 0.5, 0.5 + (a1 - 0.5) * 0.5
+    p = ease(max(N - 1, 1)).replace("{v}", "n")
+    pos = "({a}+({b}-{a})*{p})".format(a=a0, b=a1, p=p)
+    cx = "(iw-ow)*" + pos if wide else "(iw-ow)/2"
+    cy = "(ih-oh)/2" if wide else "(ih-oh)*" + pos
+    zs = 1 + (max(z0, z1) - 1) * 0.5          # gentle zoom on top of the pan
+    zin = z1 >= z0
+    zz = "{a}+({b}-{a})*{p}".format(a=1.0 if zin else zs, b=zs if zin else 1.0, p=ease(max(N - 1, 1)).replace("{v}", "in"))
+    vf = ",".join(punch_crop(shot) + [
+        "scale={0}:{1}:force_original_aspect_ratio=increase:flags=lanczos".format(W * 2, H * 2),
+        "setsar=1", "loop=loop={N}:size=1:start=0".format(N=N), "fps=%d" % fps,
+        "crop={0}:{1}:x='{x}':y='{y}'".format(W * 2, H * 2, x=cx, y=cy),
+        "zoompan=z='{z}':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={W}x{H}:fps={fps}".format(z=zz, W=W, H=H, fps=fps),
+        "format=yuv420p"])
+    run(["ffmpeg", "-y", "-v", "error", "-i", shot["image"], "-vf", vf] + enc)
     return out
 
 
@@ -300,13 +372,13 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,{font},{fs},{pc},{pc},{oc},&H80000000,-1,0,0,0,100,100,1,0,1,{ol},{sh},2,120,120,{mv},1
+Style: Cap,{font},{fs},{pc},{pc},{oc},&H80000000,-1,0,0,0,100,100,1,0,1,{ol},{sh},2,{ml},{ml},{mv},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-""".format(W=W, H=H, font=cfg["font"], fs=cfg["font_size"], pc=ass_color(cfg["text_color"]),
-           oc=ass_color(cfg["outline_color"]), ol=cfg["outline"], sh=cfg["shadow"],
-           mv=cfg["caption_margin_bottom"])
+""".format(W=W, H=H, font=cfg["font"], fs=cfg["_font_px"], ml=cfg["_margin_lr"], pc=ass_color(cfg["text_color"]),
+           oc=ass_color(cfg["outline_color"]), ol=round(cfg["outline"] * cfg["_font_px"] / 110, 1), sh=round(cfg["shadow"] * cfg["_font_px"] / 110, 1),
+           mv=int(H * (1 - cfg["_caption_y"])))
     hl = ass_color(cfg["highlight_color"])
     lines = []
     for ci, ch in enumerate(chunks):
@@ -492,7 +564,7 @@ def measure_lufs(path):
     return float(m[-1]) if m else -23.0
 
 
-def mix_audio(vo, music, sfx, total, cfg, tmp):
+def mix_audio(vo, music, sfx, total, cfg, tmp, fade=0):
     mixed = os.path.join(tmp, "mix.wav")
     gain = measure_lufs(vo) + cfg["music_volume_db"] - measure_lufs(music)
     fi, fo = cfg["music_fade_in"], cfg["music_fade_out"]
@@ -519,6 +591,8 @@ def mix_audio(vo, music, sfx, total, cfg, tmp):
           "measured_thresh={mt}:offset={off}:linear=true,aresample=48000").format(
         I=I, TP=TP, mi=m["input_i"], mtp=m["input_tp"], ml=m["input_lra"], mt=m["input_thresh"],
         off=m["target_offset"])
+    if fade:
+        af += ",afade=t=out:st=%.3f:d=%.3f" % (total - fade, fade)
     run(["ffmpeg", "-y", "-v", "error", "-i", mixed, "-af", af, "-c:a", "pcm_s16le", final])
     return final
 
@@ -533,6 +607,9 @@ def main():
     ap.add_argument("--music", help="optional music file (otherwise an ambient pad is generated)")
     ap.add_argument("--sfx", help="optional folder of sound effects (whoosh.wav, crackle.wav, ...)")
     ap.add_argument("--config", help="optional JSON config file (see config.example.json)")
+    ap.add_argument("--aspect", choices=list(ASPECTS), help="16:9 (default), 9:16, 1:1 or 4:5")
+    ap.add_argument("--fit", choices=["pan", "blur"], help="how to fit images that don't match the aspect ratio")
+    ap.add_argument("--max-duration", type=float, help="trim the video to this many seconds (e.g. 60 for Shorts)")
     ap.add_argument("--out", default="final.mp4")
     ap.add_argument("--keep-temp", action="store_true")
     a = ap.parse_args()
@@ -544,12 +621,29 @@ def main():
     if a.config:
         user = json.load(open(a.config, encoding="utf-8"))
         cfg.update({k: v for k, v in user.items() if not k.startswith("_")})
+    if a.aspect: cfg["aspect"] = a.aspect
+    if a.fit: cfg["fit"] = a.fit
+    if a.max_duration is not None: cfg["max_duration"] = a.max_duration
+    if cfg["aspect"] not in ASPECTS:
+        raise SystemExit("aspect must be one of " + ", ".join(ASPECTS))
+    (W, H), fmul, cy, mlr, mw = ASPECTS[cfg["aspect"]]
+    cfg["width"], cfg["height"] = W, H
+    cfg["_font_px"] = int(round(cfg["font_size"] * fmul))
+    cfg["_caption_y"] = cfg["caption_y"] or cy
+    cfg["_margin_lr"] = mlr
+    cfg["_fg_center"] = 0.40 if H > W else 0.5
+    if "max_words" not in (user if a.config else {}):
+        cfg["max_words"] = mw
     rng = random.Random(cfg["seed"]); nrng = np.random.default_rng(cfg["seed"])
     t0 = time.time()
     tmp = tempfile.mkdtemp(prefix="autoedit_")
     try:
-        total = probe_duration(a.audio)
-        log("voiceover %.2fs" % total)
+        total = vo_len = probe_duration(a.audio)
+        trimmed = bool(cfg["max_duration"]) and cfg["max_duration"] < total
+        if trimmed:
+            total = float(cfg["max_duration"])
+        log("voiceover %.2fs%s, output %dx%d (%s, fit=%s)" % (vo_len, " -> trimmed to %.2fs" % total if trimmed else "",
+                                                               cfg["width"], cfg["height"], cfg["aspect"], cfg["fit"]))
         scenes = load_scenes(a.images, a.scenes, total)
         shots = plan_shots(scenes, cfg, rng)
         log("%d images -> %d shots (incl. punch-ins)" % (len(scenes), len(shots)))
@@ -571,7 +665,8 @@ def main():
         sfx = os.path.join(tmp, "sfx.wav")
         hits = build_sfx_track(shots, words, total, cfg, a.sfx, nrng, sfx)
         log("sound hits: %s" % hits)
-        audio = mix_audio(a.audio, music, sfx, total, cfg, tmp)
+        words = [w for w in words if w[0] < total - 0.3]
+        audio = mix_audio(a.audio, music, sfx, total, cfg, tmp, fade=1.0 if trimmed else 0)
         log("audio mixed + normalised")
 
         workers = cfg["workers"] or max(1, (os.cpu_count() or 2) // 2)
@@ -585,6 +680,8 @@ def main():
             for s in shots:
                 f.write("file 'shot_%04d.mp4'\n" % s["index"])
         vf = "fps=%d" % cfg["fps"]
+        if trimmed:
+            vf += ",fade=t=out:st=%.3f:d=0.8" % (total - 0.8)
         if os.path.exists(ass):
             vf += ",ass=captions.ass" + (":fontsdir='%s'" % cfg["fonts_dir"].replace("\\", "/").replace(":", "\\:") if cfg["fonts_dir"] else "")
         out = os.path.abspath(a.out)
